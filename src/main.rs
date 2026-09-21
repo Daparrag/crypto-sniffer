@@ -41,6 +41,11 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    // config rustls crypto
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install rustls crypto provider");
+
     let args = Args::parse();
 
     let mut config = ConnectorConfig::new(args.endpoint)?.with_policy(args.policy);
@@ -48,7 +53,6 @@ async fn main() -> anyhow::Result<()> {
     if let Some(token) = args.x_token {
         config = config.with_token(token);
     }
-
     let mut connector = GeyserConnector::new("solana").with_config(config);
 
     connector.connect().await?;

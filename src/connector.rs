@@ -3,8 +3,8 @@ use {
     async_trait::async_trait,
     clap::ValueEnum,
     yellowstone_grpc_client::{
-        Backoff, DEFAULT_SLOT_RETENTION, GeyserGrpcClient, GeyserStream, ReconnectConfig,
-        ReconnectionPolicy,
+        Backoff, ClientTlsConfig, DEFAULT_SLOT_RETENTION, GeyserGrpcClient, GeyserStream,
+        ReconnectConfig, ReconnectionPolicy,
     },
     yellowstone_grpc_proto::prelude::{
         CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
@@ -224,11 +224,17 @@ impl Connector for GeyserConnector {
             backoff: Backoff::default(),
             policy,
         };
+        println!(
+            "Connecting to {} with policy {:?} with token {:?}",
+            self.config.endpoint, self.config.policy, self.config.x_token
+        );
 
         let client = GeyserGrpcClient::build_from_shared(self.config.endpoint.clone())
             .map_err(|error| ConnectionError::ClientError(error.to_string()))?
             .x_token(self.config.x_token.clone())
             .map_err(|error| ConnectionError::ClientError(error.to_string()))?
+            .tls_config(ClientTlsConfig::new().with_native_roots())
+            .map_err(|error| ConnectionError::ClientError(format!("{error:?}")))?
             .set_reconnect_config(reconnect_config)
             .connect()
             .await
