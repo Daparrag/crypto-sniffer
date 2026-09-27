@@ -1,4 +1,9 @@
+use futures::stream::Stream;
 use thiserror::Error;
+//use use tokio::sync::mpsc;
+//use std::pin::Pin;
+//use std::task::{Context, Poll};
+use log::{debug, info};
 use {
     async_trait::async_trait,
     clap::ValueEnum,
@@ -8,8 +13,9 @@ use {
     },
     yellowstone_grpc_proto::prelude::{
         CommitmentLevel, SubscribeRequest, SubscribeRequestFilterAccounts,
-        SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions,
+        SubscribeRequestFilterSlots, SubscribeRequestFilterTransactions, SubscribeUpdate,
     },
+    yellowstone_grpc_proto::tonic::Status,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -22,7 +28,6 @@ pub enum ReconnectingPolicy {
 pub enum ConnectionStatus {
     Down,
     Up,
-    Reconnecting,
 }
 
 #[derive(Debug, Error)]
@@ -52,7 +57,7 @@ impl ConnectorConfig {
         }
 
         Ok(Self {
-            endpoint: endpoint.into(),
+            endpoint,
             x_token: None,
             policy: ReconnectingPolicy::Recover,
         })
@@ -67,13 +72,6 @@ impl ConnectorConfig {
         self.policy = policy;
         self
     }
-
-    pub fn with_config(mut self, config: ConnectorConfig) -> Self {
-        self.endpoint = config.endpoint;
-        self.x_token = config.x_token;
-        self.policy = config.policy;
-        self
-    }
 }
 
 impl Default for ConnectorConfig {
@@ -86,13 +84,29 @@ impl Default for ConnectorConfig {
     }
 }
 
+impl PartialEq for ConnectorConfig {
+    fn eq(&self, other: &Self) -> bool {
+        (self.endpoint == other.endpoint)
+            && (self.x_token == other.x_token)
+            && (self.policy == other.policy)
+    }
+}
+
 #[async_trait]
 pub trait Connector: Send + Sync {
+    type StreamItem;
+    type StreamError;
+    type StreamType: Stream<Item = Result<Self::StreamItem, Self::StreamError>> + Send + Unpin;
+
     async fn connect(&mut self) -> Result<(), ConnectionError>;
     async fn disconnect(&mut self) -> Result<(), ConnectionError>;
-    async fn subscribe_to(&mut self, filters: Vec<Filter>)
-    -> Result<GeyserStream, ConnectionError>;
+    async fn subscribe_to(
+        &mut self,
+        filters: Vec<Filter>,
+    ) -> Result<Self::StreamType, ConnectionError>;
+    #[allow(dead_code)]
     fn status(&self) -> ConnectionStatus;
+    #[allow(dead_code)]
     fn config(&self) -> &ConnectorConfig;
 }
 
@@ -164,9 +178,8 @@ impl Filter {
     fn add_to_request(&self, request: &mut SubscribeRequest) {
         match self {
             Self::Slots(filter) => {
-                request
-                    .slots
-                    .insert(filter.name.clone(), filter.filter.clone());
+                request.slots.insert(filter.name.clone(), filter.filter);
+                debug!("Using Filter {}", filter.name());
             }
 
             Self::Accounts(filter) => {
@@ -204,6 +217,7 @@ impl GeyserConnector {
         self.config = config;
         self
     }
+
     pub fn name(&self) -> &str {
         &self.name
     }
@@ -211,6 +225,10 @@ impl GeyserConnector {
 
 #[async_trait]
 impl Connector for GeyserConnector {
+    type StreamItem = SubscribeUpdate;
+    type StreamError = Status;
+    type StreamType = GeyserStream;
+
     async fn connect(&mut self) -> Result<(), ConnectionError> {
         let policy = match self.config.policy {
             ReconnectingPolicy::Recover => ReconnectionPolicy::RecoverMissedData {
@@ -224,9 +242,11 @@ impl Connector for GeyserConnector {
             backoff: Backoff::default(),
             policy,
         };
-        println!(
-            "Connecting to {} with policy {:?} with token {:?}",
-            self.config.endpoint, self.config.policy, self.config.x_token
+        info!(
+            "Connecting to enpoint={} with policy={:?} token configure={}",
+            self.config.endpoint,
+            self.config.policy,
+            self.config.x_token.is_some()
         );
 
         let client = GeyserGrpcClient::build_from_shared(self.config.endpoint.clone())
@@ -255,7 +275,7 @@ impl Connector for GeyserConnector {
     async fn subscribe_to(
         &mut self,
         filters: Vec<Filter>,
-    ) -> Result<GeyserStream, ConnectionError> {
+    ) -> Result<Self::StreamType, ConnectionError> {
         let request = build_request(&filters);
 
         let client = self.client.as_mut().ok_or_else(|| {
@@ -267,11 +287,11 @@ impl Connector for GeyserConnector {
             .await
             .map_err(|error| ConnectionError::ClientError(error.to_string()))
     }
-
+    #[allow(dead_code)]
     fn status(&self) -> ConnectionStatus {
         self.status
     }
-
+    #[allow(dead_code)]
     fn config(&self) -> &ConnectorConfig {
         &self.config
     }
@@ -336,6 +356,27 @@ mod tests {
 
         assert!(request.slots.contains_key("custom-slots"));
         assert!(!request.slots.contains_key("slots"));
+    }
+
+    #[test]
+    fn filter_name_is_preserved() {
+        assert_eq!(
+            GeyserSlots::new("slots", SubscribeRequestFilterSlots::default()).name(),
+            "slots"
+        );
+        assert_eq!(
+            GeyserAccount::new("accounts", SubscribeRequestFilterAccounts::default()).name(),
+            "accounts"
+        );
+        assert_eq!(
+            GeyserTransaction::new(
+                "transactions",
+                SubscribeRequestFilterTransactions::default()
+            )
+            .name(),
+            "transactions"
+        );
+        assert_eq!(GeyserSlots::default().name(), "");
     }
 
     #[test]
@@ -416,6 +457,23 @@ mod tests {
         assert_eq!(config.endpoint, "http://127.0.0.1:10000");
         assert!(config.x_token.is_none());
     }
+
+    #[test]
+    fn config_valid_after_setup() {
+        let config = ConnectorConfig::default();
+        let connector = GeyserConnector::new("test").with_config(config);
+
+        assert_eq!(connector.config().endpoint, "http://127.0.0.1:10000");
+        assert!(connector.config.x_token.is_none());
+        assert_eq!(connector.config.policy, ReconnectingPolicy::Recover);
+    }
+
+    #[test]
+    fn geyser_connector_exposes_name() {
+        let connector = GeyserConnector::new("yellowstone");
+        assert_eq!(connector.name(), "yellowstone");
+    }
+
     #[tokio::test]
     async fn subscribe_before_connect_returns_connection_error() {
         let config = ConnectorConfig::default();
@@ -427,6 +485,7 @@ mod tests {
 
         assert!(matches!(result, Err(ConnectionError::ConnectionLost(_))));
     }
+
     #[tokio::test]
     async fn disconnect_sets_status_down() {
         let mut connector = GeyserConnector::new("test");
@@ -436,5 +495,12 @@ mod tests {
         connector.disconnect().await.unwrap();
 
         assert_eq!(connector.status(), ConnectionStatus::Down);
+    }
+    #[tokio::test]
+    async fn valid_name_after_assigment() {
+        let connector_1 = GeyserConnector::new("test");
+        let connector_2 = GeyserConnector::new("test2");
+        assert_eq!("test", connector_1.name());
+        assert_eq!("test2", connector_2.name());
     }
 }
