@@ -1,9 +1,6 @@
 use futures::stream::Stream;
-use thiserror::Error;
-//use use tokio::sync::mpsc;
-//use std::pin::Pin;
-//use std::task::{Context, Poll};
 use log::{debug, info};
+use thiserror::Error;
 use {
     async_trait::async_trait,
     clap::ValueEnum,
@@ -220,6 +217,41 @@ impl GeyserConnector {
 
     pub fn name(&self) -> &str {
         &self.name
+    }
+
+    pub fn build_connector(
+        endpoint: String,
+        policy: ReconnectingPolicy,
+        x_token: Option<String>,
+        name: &str,
+    ) -> Result<GeyserConnector, ConnectionError> {
+        let mut config = ConnectorConfig::new(endpoint.clone())?.with_policy(policy);
+        if let Some(token) = &x_token {
+            config = config.with_token(token.clone());
+        }
+        Ok(GeyserConnector::new(name).with_config(config))
+    }
+
+    pub fn build_filters(
+        &self,
+        enable_slots: bool,
+        enable_accounts: bool,
+        enable_transactions: bool,
+    ) -> Vec<Filter> {
+        let mut filters = Vec::new();
+        if enable_slots {
+            filters.push(Filter::Slots(GeyserSlots::slots()));
+        }
+
+        if enable_accounts {
+            filters.push(Filter::Accounts(GeyserAccount::accounts()));
+        }
+
+        if enable_transactions {
+            filters.push(Filter::Transactions(GeyserTransaction::transactions()));
+        }
+
+        filters
     }
 }
 
@@ -467,11 +499,31 @@ mod tests {
         assert!(connector.config.x_token.is_none());
         assert_eq!(connector.config.policy, ReconnectingPolicy::Recover);
     }
+    #[test]
+    fn build_connector_from_parameters() {
+        let endpoint = "http://127.0.0.1:10000".to_string();
+        let policy = ReconnectingPolicy::Skip;
+        let x_token = Some("123456789".to_string());
+        let name = "solana";
+
+        let connector = GeyserConnector::build_connector(endpoint, policy, x_token, name).unwrap();
+        assert_eq!(connector.config().endpoint, "http://127.0.0.1:10000");
+        assert_eq!(connector.config().policy, ReconnectingPolicy::Skip);
+        assert_eq!(connector.config().x_token, Some("123456789".to_string()));
+        assert_eq!(connector.name(), name);
+        assert_eq!(connector.status(), ConnectionStatus::Down);
+    }
 
     #[test]
     fn geyser_connector_exposes_name() {
         let connector = GeyserConnector::new("yellowstone");
         assert_eq!(connector.name(), "yellowstone");
+    }
+    #[test]
+    fn geyser_filters_from_connector() {
+        let connector = GeyserConnector::new("yellowstone");
+        let filters = connector.build_filters(true, true, false);
+        assert!(!filters.is_empty());
     }
 
     #[tokio::test]

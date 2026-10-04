@@ -1,19 +1,14 @@
 mod connector;
 mod timer;
 
-use crate::connector::{
-    ConnectionError, Connector, ConnectorConfig, Filter, GeyserAccount, GeyserConnector,
-    GeyserSlots, GeyserTransaction, ReconnectingPolicy,
-};
+use crate::connector::{Connector, GeyserConnector, ReconnectingPolicy};
 use crate::timer::{
-    EventEnvelope, GeyserEvent, GeyserReader, GeyserReaderError, Reader, ReceiveTimer,
-    ReceivedEvent,
+    EventEnvelope, EventSource, GeyserEvent, GeyserReader, Reader, ReaderBuilder, ReceiveTimer,
 };
 use clap::Parser;
 use log::info;
 use yellowstone_grpc_proto::prelude::{
-    SubscribeUpdate, SubscribeUpdateAccount, SubscribeUpdateSlot, SubscribeUpdateTransaction,
-    subscribe_update::UpdateOneof,
+    SubscribeUpdateAccount, SubscribeUpdateSlot, SubscribeUpdateTransaction,
 };
 
 #[derive(Debug, Parser)]
@@ -104,66 +99,6 @@ fn handle_event(event: &EventEnvelope<GeyserEvent>) {
     }
 }
 
-fn normalize_geyser(
-    received: ReceivedEvent<SubscribeUpdate>,
-) -> Result<EventEnvelope<GeyserEvent>, GeyserReaderError> {
-    let (source, connection_epoch, recv_seq, received_mono_ns, payload) = received.into_parts();
-
-    let update = payload
-        .update_oneof
-        .ok_or(GeyserReaderError::InvalidEvent)?;
-
-    let event = match update {
-        UpdateOneof::Slot(slot) => GeyserEvent::Slot(slot),
-
-        UpdateOneof::Account(account) => GeyserEvent::AccountUpdate(account),
-
-        UpdateOneof::Transaction(tx) => GeyserEvent::Transactions(Box::new(tx)),
-
-        _ => {
-            return Err(GeyserReaderError::InvalidEvent);
-        }
-    };
-
-    Ok(EventEnvelope::new(
-        source,
-        connection_epoch,
-        recv_seq,
-        received_mono_ns,
-        event,
-    ))
-}
-
-// entry  function for building a geyser connector
-fn build_geyser_connector(args: &Args, name: &str) -> Result<GeyserConnector, ConnectionError> {
-    let mut config = ConnectorConfig::new(args.endpoint.clone())?.with_policy(args.policy);
-
-    if let Some(token) = &args.x_token {
-        config = config.with_token(token.clone());
-    }
-
-    Ok(GeyserConnector::new(name).with_config(config))
-}
-
-// entry fuction for buliding geyser fiters
-fn build_geyser_filters(args: &Args) -> Vec<Filter> {
-    let mut filters = Vec::new();
-
-    if args.slots {
-        filters.push(Filter::Slots(GeyserSlots::slots()));
-    }
-
-    if args.accounts {
-        filters.push(Filter::Accounts(GeyserAccount::accounts()));
-    }
-
-    if args.transactions {
-        filters.push(Filter::Transactions(GeyserTransaction::transactions()));
-    }
-
-    filters
-}
-
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // config rustls crypto
@@ -174,10 +109,11 @@ async fn main() -> anyhow::Result<()> {
 
     let clock = ReceiveTimer::new();
 
-    let mut connector = build_geyser_connector(&args, "solana")?;
+    let mut connector =
+        GeyserConnector::build_connector(args.endpoint, args.policy, args.x_token, "solana")?;
     info!("connector: {} has been initialized ...", connector.name());
     connector.connect().await?;
-    let filters = build_geyser_filters(&args);
+    let filters = connector.build_filters(args.slots, args.accounts, args.transactions);
     if filters.is_empty() {
         anyhow::bail!(
             "at least one subscription filter is required: \
@@ -186,9 +122,21 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let stream = connector.subscribe_to(filters).await?;
-    let mut reader = GeyserReader::new(stream, clock.clone());
+    let geyser_stream = Box::pin(stream);
+    let mut reader: GeyserReader<ReceiveTimer> = ReaderBuilder::new()
+        .with_stream(geyser_stream)
+        .with_clock(clock)
+        .with_source(EventSource::Yellowstone)
+        .build()?;
+
+    info!(
+        "starting event stream processing - epoch={} seq={} source={}",
+        reader.connection_epoch(),
+        reader.recv_seq(),
+        reader.source(),
+    );
     while let Some(received) = reader.next().await? {
-        let event = normalize_geyser(received)?;
+        let event = received.normalize()?;
         handle_event(&event);
     }
     connector.disconnect().await?;
